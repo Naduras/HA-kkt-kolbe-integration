@@ -29,6 +29,26 @@ from .exceptions import KKTTimeoutError
 
 _LOGGER = logging.getLogger(__name__)
 
+# Writing a data point: how often to try, and how long to wait before reading
+# the state back when the device did not acknowledge the write.
+SET_DP_ATTEMPTS = 2
+SET_DP_VERIFY_DELAY = 1.0
+
+
+def _dp_values_equal(actual: Any, expected: Any) -> bool:
+    """Compare a reported DP value with a written one (bool/int/str tolerant)."""
+    if actual == expected:
+        return True
+    if isinstance(actual, bool) or isinstance(expected, bool):
+
+        def _as_bool(value: Any) -> bool:
+            if isinstance(value, bool):
+                return value
+            return str(value).strip().lower() in ("true", "1", "on")
+
+        return _as_bool(actual) == _as_bool(expected)
+    return str(actual).strip().lower() == str(expected).strip().lower()
+
 
 class KKTKolbeTuyaDevice:
     """Handle communication with KKT Kolbe device via Tuya protocol."""
@@ -738,6 +758,27 @@ class KKTKolbeTuyaDevice:
         """Return True if device is on (DP 1)."""
         return bool(self.get_dp_value(1, False))
 
+    @staticmethod
+    def _is_write_acknowledged(dp: int, value: Any, result: Any) -> bool:
+        """Return True if tinytuya's set_value() response confirms the write.
+
+        tinytuya returns ``None`` when the device sent no answer, an error dict
+        (``Error``/``Err``) on failure, and otherwise the decoded payload. A
+        payload that reports this DP with a different value means the device
+        did not apply the write.
+        """
+        if not isinstance(result, dict):
+            return False
+        if "Error" in result or "Err" in result:
+            return False
+        dps = result.get("dps")
+        if isinstance(dps, dict):
+            reported = dps.get(str(dp), dps.get(dp))
+            if reported is not None:
+                return _dp_values_equal(reported, value)
+        # The device answered but did not echo this DP: treat as acknowledged.
+        return True
+
     def get_dp_value(self, dp: int, default: Any = None) -> Any:
         """Get data point value from cached status."""
         return self._status.get("dps", {}).get(str(dp), default)
@@ -879,15 +920,51 @@ class KKTKolbeTuyaDevice:
             raise KKTConnectionError(operation="set_dp", device_id=self.device_id[:8], reason="Device not connected")
 
         try:
-            # Explicit set_value() call with timeout protection
-            result = await self._async_device_call(self._device.set_value, dp, value, timeout=8.0)
+            for attempt in range(1, SET_DP_ATTEMPTS + 1):
+                # Explicit set_value() call with timeout protection
+                result = await self._async_device_call(self._device.set_value, dp, value, timeout=8.0)
 
-            # Validate the result
-            if result is None:
-                _LOGGER.warning(f"set_value returned None for DP {dp} = {value}")
+                if self._is_write_acknowledged(dp, value, result):
+                    _LOGGER.debug(f"Successfully set DP {dp} to {value}")
+                    return True
 
-            _LOGGER.debug(f"Successfully set DP {dp} to {value}")
-            return True
+                # No (or no matching) acknowledgement: the device may have ignored
+                # the write, e.g. while it is being operated at its own panel.
+                # Read the real state back instead of reporting success blindly.
+                _LOGGER.debug(
+                    "No acknowledgement for DP %s = %s (attempt %d, result %r), verifying", dp, value, attempt, result
+                )
+                await asyncio.sleep(SET_DP_VERIFY_DELAY)
+                status = await self._async_device_call(self._device.status, timeout=10.0)
+                dps = status.get("dps", {}) if isinstance(status, dict) else {}
+                if isinstance(dps, dict) and dps:
+                    self._status = {"dps": {**self._status.get("dps", {}), **dps}}
+                actual = dps.get(str(dp), dps.get(dp)) if isinstance(dps, dict) else None
+
+                if actual is None:
+                    # Device did not report this DP: cannot verify, keep the old behaviour.
+                    _LOGGER.warning(
+                        "set_value returned no acknowledgement for DP %s = %s and the device did not report it back; "
+                        "assuming success",
+                        dp,
+                        value,
+                    )
+                    return True
+                if _dp_values_equal(actual, value):
+                    _LOGGER.debug("DP %s = %s verified by status read (no acknowledgement)", dp, value)
+                    return True
+
+                _LOGGER.warning(
+                    "Device ignored DP %s = %s (still %r) on attempt %d of %d",
+                    dp,
+                    value,
+                    actual,
+                    attempt,
+                    SET_DP_ATTEMPTS,
+                )
+
+            _LOGGER.warning("Device did not apply DP %s = %s after %d attempts", dp, value, SET_DP_ATTEMPTS)
+            return False
 
         except asyncio.CancelledError:
             # Handle cancellation - cleanup but re-raise

@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [4.9.1] - 2026-11-12
+
+### Fixed
+
+- **Ignorierte Befehle werden nicht mehr als Erfolg gemeldet**: Antwortete das Gerät auf einen lokalen Schreibbefehl nicht (`set_value returned None`) oder meldete es den alten Wert zurück, galt der Befehl bisher trotzdem als erfolgreich. Die Entity zeigte dann 8 Sekunden lang den gewünschten Zustand und sprang danach auf den echten Zustand zurück, ohne dass Automationen davon etwas mitbekamen. Jetzt liest die Integration in diesem Fall den Zustand des Geräts zurück, sendet den Befehl bei Abweichung ein zweites Mal und meldet einen Fehler, wenn das Gerät ihn weiterhin nicht übernimmt. Die Entity zeigt dann sofort wieder den echten Zustand, und Automationen bekommen den Fehler mit. Beobachtet an einer EASY/PLOOM-Haube, die nach Bedienung am Bedienfeld das Ausschalten über DP 1 ignorierte.
+
 ## [4.9.0] - 2026-11-10
 
 ### Changed (Home Assistant 2026.x Upgrade)

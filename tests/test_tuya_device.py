@@ -143,3 +143,72 @@ async def test_failed_heartbeat_drops_connection(monkeypatch) -> None:
     assert device.is_connected is False
     raw.close.assert_called_once()
     device._stop_heartbeat()
+
+
+# --- Write verification (device ignores a command) -------------------------
+
+
+@pytest.mark.asyncio
+async def test_set_dp_acknowledged_by_echo(monkeypatch) -> None:
+    """A response that echoes the written value counts as success without a status read."""
+    monkeypatch.setattr(tuya_device_module, "SET_DP_VERIFY_DELAY", 0)
+    device, raw = _connected_device()
+    raw.set_value.return_value = {"dps": {"1": False}}
+    raw.status.reset_mock()
+    assert await device.async_set_dp(1, False) is True
+    raw.set_value.assert_called_once_with(1, False)
+    raw.status.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_set_dp_without_ack_verified_by_status(monkeypatch) -> None:
+    """No acknowledgement, but the device did apply the value: success after one status read."""
+    monkeypatch.setattr(tuya_device_module, "SET_DP_VERIFY_DELAY", 0)
+    device, raw = _connected_device()
+    raw.set_value.return_value = None
+    raw.status.return_value = {"dps": {"1": False}}
+    assert await device.async_set_dp(1, False) is True
+    assert raw.set_value.call_count == 1
+    assert device.get_dp_value(1) is False
+
+
+@pytest.mark.asyncio
+async def test_set_dp_ignored_by_device_returns_false(monkeypatch) -> None:
+    """The device keeps its old value: retry once, then report failure instead of success."""
+    monkeypatch.setattr(tuya_device_module, "SET_DP_VERIFY_DELAY", 0)
+    device, raw = _connected_device()
+    raw.set_value.return_value = None
+    raw.status.return_value = {"dps": {"1": True}}
+    assert await device.async_set_dp(1, False) is False
+    assert raw.set_value.call_count == tuya_device_module.SET_DP_ATTEMPTS
+    assert device.get_dp_value(1) is True
+
+
+@pytest.mark.asyncio
+async def test_set_dp_echo_with_old_value_triggers_verification(monkeypatch) -> None:
+    """A response reporting the old value is not an acknowledgement."""
+    monkeypatch.setattr(tuya_device_module, "SET_DP_VERIFY_DELAY", 0)
+    device, raw = _connected_device()
+    raw.set_value.side_effect = [{"dps": {"10": "three"}}, {"dps": {"10": "off"}}]
+    raw.status.return_value = {"dps": {"10": "three"}}
+    assert await device.async_set_dp(10, "off") is True
+    assert raw.set_value.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_set_dp_error_dict_and_unverifiable_dp(monkeypatch) -> None:
+    """An error response is verified; if the device does not report the DP, keep the old behaviour."""
+    monkeypatch.setattr(tuya_device_module, "SET_DP_VERIFY_DELAY", 0)
+    device, raw = _connected_device()
+    raw.set_value.return_value = {"Error": "Network Error: Device Unreachable", "Err": "905"}
+    raw.status.return_value = {"dps": {"4": False}}
+    assert await device.async_set_dp(1, False) is True
+    assert raw.set_value.call_count == 1
+
+
+def test_dp_values_equal_tolerates_types() -> None:
+    """Bool/str/int representations of the same value compare equal."""
+    eq = tuya_device_module._dp_values_equal
+    assert eq(True, "true") and eq("1", True) and eq(False, "false") and eq(0, False)
+    assert not eq(True, False) and not eq("one", "two")
+    assert eq("Three", "three") and eq(5, "5")
