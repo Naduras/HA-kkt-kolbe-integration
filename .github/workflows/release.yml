@@ -1,7 +1,7 @@
 name: Release
 
 # Builds the HACS zip (kkt_kolbe.zip) and attaches it to the GitHub release.
-# HACS downloads this asset because hacs.json sets "zip_release": true.
+# This fork installs from the branch (no "zip_release" in hacs.json); the asset is optional.
 on:
   release:
     types: [published]
