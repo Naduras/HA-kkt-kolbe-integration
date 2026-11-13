@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import logging
 import random
+import select
 import socket
 import time
 from collections.abc import Callable
@@ -33,6 +34,11 @@ _LOGGER = logging.getLogger(__name__)
 # the state back when the device did not acknowledge the write.
 SET_DP_ATTEMPTS = 2
 SET_DP_VERIFY_DELAY = 1.0
+
+# Clearing the socket before a request: upper bound of messages to read in one
+# go and how long a single (already started) message may take to arrive.
+DRAIN_MAX_MESSAGES = 64
+DRAIN_READ_TIMEOUT = 1.0
 
 
 def _dp_values_equal(actual: Any, expected: Any) -> bool:
@@ -95,6 +101,12 @@ class KKTKolbeTuyaDevice:
             "last_connect_time": None,
             "last_disconnect_time": None,
             "protocol_version_detected": None,
+            # Messages found waiting on the socket before a request (see
+            # _drain_pending_messages): heartbeat/write acks vs. status reports.
+            "stale_acks_dropped": 0,
+            "stale_status_dropped": 0,
+            "last_stale_status_time": None,
+            "stale_resets": 0,
         }
         # Don't connect in __init__ - will be done async
 
@@ -200,11 +212,87 @@ class KKTKolbeTuyaDevice:
                 raise KKTConnectionError(
                     operation="device_call", device_id=self.device_id[:8], reason="Device not connected"
                 )
-            result = await asyncio.wait_for(self._run_executor_job(func, *args), timeout=timeout)
+            result = await asyncio.wait_for(
+                self._run_executor_job(self._call_on_clean_socket, device, func, *args), timeout=timeout
+            )
             self._last_io = time.monotonic()
             # tinytuya opens a new socket after every reconnect
             self._configure_socket_keepalive(device)
             return result
+
+    def _call_on_clean_socket(self, device: Any, func: Callable[..., Any], *args: Any) -> Any:
+        """Run one tinytuya call after discarding everything that is already waiting."""
+        self._drain_pending_messages(device)
+        return func(*args)
+
+    def _drain_pending_messages(self, device: Any) -> int:
+        """Discard messages the device sent since the last request.
+
+        tinytuya does not match answers to requests: every call returns the
+        next message with a payload that it finds on the socket. On the
+        persistent connection the device also sends messages nobody reads -
+        heartbeat acknowledgements, status reports after a change at the panel
+        and additional reports after a write. Each unread report made every
+        later call return a message that was one request old, so the state in
+        Home Assistant fell further and further behind the device (minutes
+        after a few power cycles) and writes were "confirmed" by old reports.
+
+        Reading the socket empty right before a request keeps request and
+        answer together. Runs in the executor (blocking socket).
+        """
+        sock = getattr(device, "socket", None)
+        receive = getattr(device, "_receive", None)
+        if not isinstance(sock, socket.socket) or not callable(receive):
+            return 0
+
+        acks = 0
+        reports = 0
+        try:
+            previous_timeout = sock.gettimeout()
+            sock.settimeout(DRAIN_READ_TIMEOUT)
+            try:
+                while select.select([sock], [], [], 0)[0]:
+                    if acks + reports >= DRAIN_MAX_MESSAGES:
+                        raise OSError("too many pending messages")
+                    msg = receive()
+                    if msg is not None and getattr(msg, "payload", b""):
+                        reports += 1
+                    else:
+                        acks += 1
+            finally:
+                sock.settimeout(previous_timeout)
+        except Exception as err:
+            # Connection closed by the device, broken frame or a flood of
+            # messages: start over on a fresh connection, tinytuya reconnects
+            # on the request that follows.
+            _LOGGER.debug("Resetting connection to %s while clearing the socket: %s", self.device_id[:8], err)
+            self._connection_stats["stale_resets"] += 1
+            self._close_device_socket(device)
+
+        if acks or reports:
+            self._connection_stats["stale_acks_dropped"] += acks
+            self._connection_stats["stale_status_dropped"] += reports
+            if reports:
+                from datetime import datetime
+
+                self._connection_stats["last_stale_status_time"] = datetime.now().isoformat()
+            _LOGGER.debug(
+                "Dropped %d pending message(s) from %s before the request (%d status report(s))",
+                acks + reports,
+                self.device_id[:8],
+                reports,
+            )
+        return acks + reports
+
+    @staticmethod
+    def _close_device_socket(device: Any) -> None:
+        """Close tinytuya's socket so that the next request opens a new one."""
+        with contextlib.suppress(Exception):
+            force_close = getattr(device, "_check_socket_close", None)
+            if callable(force_close):
+                force_close(True)
+            else:
+                device.close()
 
     def _start_heartbeat(self) -> None:
         """Keep the persistent socket alive between polls."""
@@ -856,7 +944,8 @@ class KKTKolbeTuyaDevice:
                         )
                         dps = cached_dps
 
-            self._status = {"dps": dps}  # Store for get_dp_value()
+            # Store for get_dp_value(); a report can carry only the changed DPs
+            self._status = {"dps": {**self._status.get("dps", {}), **dps}}
             _LOGGER.debug(f"Retrieved status with {len(dps)} data points: {list(dps.keys())}")
             return dps
 

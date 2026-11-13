@@ -212,3 +212,172 @@ def test_dp_values_equal_tolerates_types() -> None:
     assert eq(True, "true") and eq("1", True) and eq(False, "false") and eq(0, False)
     assert not eq(True, False) and not eq("one", "two")
     assert eq("Three", "three") and eq(5, "5")
+
+
+# --- Stale messages on the persistent socket -------------------------------
+
+
+class _FakeTuyaMessage:
+    def __init__(self, payload: bytes) -> None:
+        self.payload = payload
+
+
+class _FramedDevice:
+    """Minimal stand-in for tinytuya: one message per line, like ``_receive()``.
+
+    ``status()`` behaves like tinytuya: it sends a query and returns the next
+    message with a payload - whichever is first on the socket.
+    """
+
+    def __init__(self, sock: socket_module.socket) -> None:
+        self.socket: socket_module.socket | None = sock
+        self.force_closed = False
+
+    def _receive(self) -> _FakeTuyaMessage:
+        assert self.socket is not None
+        data = b""
+        while not data.endswith(b"\n"):
+            chunk = self.socket.recv(1)
+            if not chunk:
+                raise ConnectionError("connection closed")
+            data += chunk
+        return _FakeTuyaMessage(data.strip())
+
+    def _check_socket_close(self, force: bool = False) -> None:
+        if force and self.socket is not None:
+            self.socket.close()
+            self.socket = None
+            self.force_closed = True
+
+    def status(self) -> dict[str, str]:
+        assert self.socket is not None
+        self.socket.sendall(b"query\n")
+        while True:
+            msg = self._receive()
+            if msg.payload:
+                return {"answer": msg.payload.decode()}
+
+    def close(self) -> None:
+        if self.socket is not None:
+            self.socket.close()
+            self.socket = None
+
+
+def _framed_device() -> tuple[KKTKolbeTuyaDevice, _FramedDevice, socket_module.socket]:
+    ours, theirs = socket_module.socketpair()
+    ours.settimeout(5)
+    device = KKTKolbeTuyaDevice("bf735dfe2ad64fba7cpyhn", "192.168.1.100", "1234567890abcdef", version="3.5")
+    raw = _FramedDevice(ours)
+    device._device = raw
+    device._connected = True
+    return device, raw, theirs
+
+
+def test_drain_discards_pending_messages() -> None:
+    """Acks and status reports nobody asked for are removed before a request."""
+    device, raw, peer = _framed_device()
+    try:
+        # two heartbeat acks (empty) and two unsolicited status reports
+        peer.sendall(b"\n\nreport-1\nreport-2\n")
+        time.sleep(0.05)
+
+        assert device._drain_pending_messages(raw) == 4
+        stats = device.connection_stats
+        assert stats["stale_acks_dropped"] == 2
+        assert stats["stale_status_dropped"] == 2
+        assert stats["last_stale_status_time"] is not None
+        assert stats["stale_resets"] == 0
+        # nothing left, socket untouched and its timeout restored
+        assert device._drain_pending_messages(raw) == 0
+        assert raw.socket is not None
+        assert raw.socket.gettimeout() == 5
+    finally:
+        peer.close()
+        raw.close()
+
+
+def test_drain_ignores_devices_without_real_socket() -> None:
+    """Mocks and devices that are not connected are left alone."""
+    device, raw = _connected_device()
+    assert device._drain_pending_messages(raw) == 0
+    raw.socket = MagicMock()
+    assert device._drain_pending_messages(raw) == 0
+    raw._receive.assert_not_called()
+
+
+def test_drain_resets_connection_closed_by_device() -> None:
+    """A connection the device closed is dropped so the request reconnects."""
+    device, raw, peer = _framed_device()
+    peer.close()
+    time.sleep(0.05)
+
+    assert device._drain_pending_messages(raw) == 0
+    assert raw.force_closed is True
+    assert raw.socket is None
+    assert device.connection_stats["stale_resets"] == 1
+
+
+def test_drain_resets_connection_on_message_flood(monkeypatch) -> None:
+    """More pending messages than the limit: start over instead of reading forever."""
+    monkeypatch.setattr(tuya_device_module, "DRAIN_MAX_MESSAGES", 3)
+    device, raw, peer = _framed_device()
+    try:
+        peer.sendall(b"a\nb\nc\nd\ne\n")
+        time.sleep(0.05)
+
+        assert device._drain_pending_messages(raw) == 3
+        assert raw.force_closed is True
+        assert device.connection_stats["stale_resets"] == 1
+    finally:
+        peer.close()
+
+
+@pytest.mark.asyncio
+async def test_request_gets_its_own_answer_despite_old_reports() -> None:
+    """Regression: an old report must not be returned as the answer to a new request.
+
+    Without clearing the socket, ``status()`` returned ``old-report`` and the
+    real answer stayed behind for the next poll - every later poll was one
+    message late.
+    """
+    device, raw, peer = _framed_device()
+
+    def _hood() -> None:
+        # the device answers each query with the state at that moment
+        for answer in (b"fresh-1\n", b"fresh-2\n"):
+            data = b""
+            while not data.endswith(b"query\n"):
+                data += peer.recv(16)
+            peer.sendall(answer)
+
+    try:
+        peer.sendall(b"\nold-report\n")  # heartbeat ack + report after a change at the panel
+        time.sleep(0.05)
+        thread = threading.Thread(target=_hood, daemon=True)
+        thread.start()
+
+        first = await device._async_device_call(raw.status, timeout=5.0)
+        peer.sendall(b"another-old-report\n")
+        time.sleep(0.05)
+        second = await device._async_device_call(raw.status, timeout=5.0)
+        thread.join(timeout=2)
+
+        assert first == {"answer": "fresh-1"}
+        assert second == {"answer": "fresh-2"}
+        assert device.connection_stats["stale_status_dropped"] == 2
+    finally:
+        peer.close()
+        raw.close()
+
+
+@pytest.mark.asyncio
+async def test_status_keeps_data_points_missing_from_a_report() -> None:
+    """A report with only the changed DP must not wipe the other known DPs."""
+    device, raw = _connected_device()
+    raw.status.return_value = {"dps": {"1": True, "4": False, "10": "off"}}
+    await device.async_get_status()
+    raw.status.return_value = {"dps": {"10": "three"}}
+
+    assert await device.async_get_status() == {"10": "three"}
+    assert device.get_dp_value(1) is True
+    assert device.get_dp_value(10) == "three"
