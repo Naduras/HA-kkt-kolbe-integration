@@ -184,6 +184,11 @@ async def async_get_config_entry_diagnostics(hass: HomeAssistant, entry: KKTKolb
                 "last_connect_time": stats.get("last_connect_time"),
                 "last_disconnect_time": stats.get("last_disconnect_time"),
                 "protocol_version_detected": stats.get("protocol_version_detected"),
+                # Messages that were waiting on the socket before a request
+                "stale_acks_dropped": stats.get("stale_acks_dropped", 0),
+                "stale_status_dropped": stats.get("stale_status_dropped", 0),
+                "last_stale_status_time": stats.get("last_stale_status_time"),
+                "stale_resets": stats.get("stale_resets", 0),
             }
 
     # Add API client diagnostics
